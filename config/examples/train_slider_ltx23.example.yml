@@ -3,9 +3,15 @@
 #
 # Concept sliders teach the model a bipolar concept axis (e.g. day ↔ night)
 # using contrastive prompt pairs — no training videos required.
-# The images in the dataset are ignored; they only provide a latent shape/noise
-# carrier for the training loop. A 512x512 blank placeholder image is included
-# at config/examples/slider_dummy_dataset/ for convenience.
+#
+# You can train with:
+#   - Text prompt pairs only (default): the dummy dataset below provides noise
+#     carriers for the training loop; image content is ignored.
+#   - Image pairs + text (optional): supply real before/after images via the
+#     slider.datasets field for image-supervised training (see bottom of file).
+#
+# Multiple concept axes can be trained jointly using the targets list.
+# Optional anchors constrain the LoRA to prevent unrelated concept drift.
 #
 # Hardware target: RTX 3090 24GB with quantization + layer offloading.
 # The text encoder (Gemma) is frozen and offloaded after prompt caching.
@@ -67,7 +73,10 @@ config:
 
       # The dataset images are NOT used for slider concept learning —
       # only their encoded latents serve as noise carriers for the training loop.
-      # Any image folder works here; a blank placeholder is provided for convenience.
+      # Any image folder works; a blank placeholder is provided for convenience.
+      # If you supply image pairs under slider.datasets below, you can keep this
+      # entry as-is — it drives the CFG slider loss while slider.datasets drives
+      # the image pair loss independently.
       datasets:
         - folder_path: "config/examples/slider_dummy_dataset"
           caption_ext: "txt"
@@ -138,30 +147,77 @@ config:
         verbose: false
 
       slider:
-        # guidance_strength controls how strongly the contrastive offset is applied
-        # to the training targets. 3.0 is a sensible default; increase for a stronger
-        # effect, decrease if the slider becomes too aggressive.
+        # guidance_strength controls how strongly the contrastive offset is applied.
+        # 3.0 is a sensible default; increase for a stronger effect, decrease if
+        # the slider becomes too aggressive or unstable.
         guidance_strength: 3.0
 
-        # anchor_strength weights the anchor loss term (if anchor_class is set).
-        # The anchor prevents unrelated concepts from drifting.
+        # anchor_strength weights the anchor loss (if anchors are set).
+        # Anchors prevent unrelated concepts from drifting during training.
         anchor_strength: 1.0
 
-        # target_class: the neutral/base context for the slider.
-        # Leave blank for a fully generic slider, or set to a subject (e.g. "a landscape")
-        # to bias the slider toward that domain.
-        target_class: ""
+        # ------------------------------------------------------------------
+        # Concept axes — what the slider learns
+        #
+        # targets: list of concept pairs to train jointly.
+        # Each entry defines one positive/negative pole and an optional weight
+        # to balance its contribution relative to the other targets.
+        #
+        # target_class: neutral context the slider operates within.
+        # Leave blank for a fully generic slider, or set to a subject
+        # (e.g. "a landscape") to bias the slider toward that domain.
+        # ------------------------------------------------------------------
+        targets:
+          - target_class: ""
+            positive: "daytime scene, bright sunlight, blue sky, day"
+            negative: "nighttime scene, dark sky, stars, moonlight, night, low light"
+            weight: 1.0
 
-        # The two poles of the concept axis.
-        # positive_prompt → what the slider's positive direction should feel like.
-        # negative_prompt → what the slider's negative direction should feel like.
-        positive_prompt: "daytime scene, bright sunlight, blue sky, golden hour lighting, day"
-        negative_prompt: "nighttime scene, dark sky, stars, moonlight, night, low light"
+          # Add more axes here if needed, e.g.:
+          # - target_class: "a city"
+          #   positive: "busy, crowded, rush hour"
+          #   negative: "empty, quiet, deserted"
+          #   weight: 0.5
 
-        # Optional: anchor_class keeps unrelated concepts stable.
-        # Uncomment and set to a neutral prompt to prevent concept bleed.
+        # ------------------------------------------------------------------
+        # Anchors (optional)
+        # Prompts that should be held stable — the LoRA is penalised for
+        # changing its output on these. Useful to prevent concept bleed.
+        # ------------------------------------------------------------------
+        # anchors:
+        #   - prompt: "a photo"
+        #     multiplier: 1.0
+
+        # ------------------------------------------------------------------
+        # Legacy single-pair syntax (still works — no config changes needed):
+        # ------------------------------------------------------------------
+        # positive_prompt: "daytime scene, bright sunlight, blue sky, day"
+        # negative_prompt: "nighttime scene, dark sky, stars, moonlight, night, low light"
+        # target_class: ""
         # anchor_class: "a photo"
 
+        # ------------------------------------------------------------------
+        # Image pair datasets (optional)
+        # Supply real before/after image pairs for image-supervised training.
+        # Combinable with the text targets above — both losses run each step.
+        # ------------------------------------------------------------------
+        # datasets:
+        #   # Side-by-side pairs: left half = negative image, right half = positive
+        #   - pair_folder: "/path/to/side-by-side-pairs"
+        #     network_weight: 2.0
+        #     target_class: ""    # fallback caption if no .txt file alongside image
+        #     size: 512
+        #
+        #   # Or separate positive/negative folders (filenames must match):
+        #   # - pos_folder: "/path/to/positive-images"
+        #   #   neg_folder: "/path/to/negative-images"
+        #   #   network_weight: 2.0
+        #   #   target_class: ""
+        #   #   size: 512
+
+        # img_loss_weight: 1.0   # scale applied to the image pair MSE loss
+        # cfg_loss_weight: 1.0   # scale applied to the CFG slider loss
+
 meta:
-  name: "[name]"
+  name: "day_night_slider_ltx23"
   version: "1.0"

@@ -401,8 +401,6 @@ class ConceptSliderTrainer(DiffusionTrainer):
             # Split side-by-side: left=negative, right=positive
             negative_images, positive_images = torch.chunk(imgs, 2, dim=3)
 
-            height = positive_images.shape[2]
-            width = positive_images.shape[3]
             img_batch_size = positive_images.shape[0]
 
             with torch.no_grad():
@@ -416,32 +414,79 @@ class ConceptSliderTrainer(DiffusionTrainer):
                     self.device_torch, dtype=dtype
                 )
 
-                # Independent noise and timestep for image pairs
-                noise_img = self.sd.get_latent_noise(
-                    pixel_height=height,
-                    pixel_width=width,
-                    batch_size=img_batch_size,
+                # Noise matching latent shape (randn_like handles 4D and 5D)
+                noise_img = self.sd.get_latent_noise_from_latents(
+                    positive_latents,
                     noise_offset=self.train_config.noise_offset,
                 ).to(self.device_torch, dtype=dtype)
 
-                # Sample random timestep
-                max_ts = self.sd.noise_scheduler.config.num_train_timesteps
-                ts_img = torch.randint(
-                    0, max_ts, (img_batch_size,), device=self.device_torch
-                ).long()
+                if self.sd.is_flow_matching:
+                    # --- Shifted logit-normal sigma sampling ---
+                    # seq_len from actual latent dims — architecture-agnostic and
+                    # correct for both LTX (32x spatial) and WAN (8x spatial).
+                    lat_dims = positive_latents.shape  # [B, C, F, H, W]
+                    seq_len = int(lat_dims[2] * lat_dims[3] * lat_dims[4])
+                    seq_len_clamped = max(1024, min(4096, seq_len))
+                    # Shift interpolated linearly between 0.95 (1024 tokens) and
+                    # 2.05 (4096 tokens) — from the official LTX timestep sampler.
+                    shift = 0.95 + (2.05 - 0.95) * (seq_len_clamped - 1024) / (4096 - 1024)
+                    std = 1.0
+                    eps = 1e-3
+                    uniform_prob = 0.1
 
-                # Add noise (forward diffusion)
-                noisy_pos = self.sd.noise_scheduler.add_noise(
-                    positive_latents, noise_img, ts_img
-                )
-                noisy_neg = self.sd.noise_scheduler.add_noise(
-                    negative_latents, noise_img, ts_img
-                )
+                    normal_samples = torch.randn(img_batch_size, device=self.device_torch) * std + shift
+                    logit_samples = torch.sigmoid(normal_samples)
 
-                # Concatenate so LoRA can run [+weight, -weight] in one call
-                noisy_combined = torch.cat([noisy_pos, noisy_neg], dim=0)
-                ts_combined = torch.cat([ts_img, ts_img], dim=0)
-                noise_combined = torch.cat([noise_img, noise_img], dim=0)
+                    # Percentile bounds for stretching to [0, 1]
+                    p_high = torch.sigmoid(torch.tensor(shift + 3.0902 * std, device=self.device_torch))
+                    p_low  = torch.sigmoid(torch.tensor(shift - 2.5758 * std, device=self.device_torch))
+                    stretched = (logit_samples - p_low) / (p_high - p_low + 1e-8)
+                    # Reflect near-zero values for numerical stability
+                    stretched = torch.where(stretched >= eps, stretched, 2 * eps - stretched)
+                    stretched = torch.clamp(stretched, 0.0, 1.0)
+
+                    # Mix with uniform fallback (prevents distribution collapse)
+                    uniform_samples = (1 - eps) * torch.rand(img_batch_size, device=self.device_torch) + eps
+                    rand_mask = torch.rand(img_batch_size, device=self.device_torch) > uniform_prob
+                    sigma_img = torch.where(rand_mask, stretched, uniform_samples)  # [B], in (0, 1)
+
+                    # --- Flow matching forward process ---
+                    # noisy = (1 - sigma) * x + sigma * noise
+                    sigma_5d = sigma_img.view(img_batch_size, 1, 1, 1, 1)
+                    noisy_pos = (1.0 - sigma_5d) * positive_latents + sigma_5d * noise_img
+                    noisy_neg = (1.0 - sigma_5d) * negative_latents + sigma_5d * noise_img
+
+                    noisy_combined = torch.cat([noisy_pos, noisy_neg], dim=0)
+                    noise_combined = torch.cat([noise_img, noise_img], dim=0)
+                    # ai-toolkit's predict_noise expects timesteps in [0, 1000] range;
+                    # it divides by 1000 internally before passing to the transformer.
+                    sigma_combined = torch.cat([sigma_img, sigma_img], dim=0)
+                    ts_combined = sigma_combined * 1000.0
+
+                    # --- Flow matching velocity target: noise - latents ---
+                    pos_latents_combined = torch.cat([positive_latents, negative_latents], dim=0)
+                    target = noise_combined - pos_latents_combined
+
+                else:
+                    # DDPM path for non-flow-matching models (SD 1.x, SD 2.x)
+                    max_ts = self.sd.noise_scheduler.config.num_train_timesteps
+                    ts_img = torch.randint(
+                        0, max_ts, (img_batch_size,), device=self.device_torch
+                    ).long()
+
+                    noisy_pos = self.sd.noise_scheduler.add_noise(positive_latents, noise_img, ts_img)
+                    noisy_neg = self.sd.noise_scheduler.add_noise(negative_latents, noise_img, ts_img)
+
+                    noisy_combined = torch.cat([noisy_pos, noisy_neg], dim=0)
+                    ts_combined = torch.cat([ts_img, ts_img], dim=0)
+                    noise_combined = torch.cat([noise_img, noise_img], dim=0)
+
+                    if self.sd.prediction_type == "v_prediction":
+                        target = self.sd.noise_scheduler.get_velocity(
+                            noisy_combined, noise_combined, ts_combined
+                        )
+                    else:
+                        target = noise_combined
 
                 # Look up prompt embeddings from cache
                 embedding_list = []
@@ -465,13 +510,6 @@ class ConceptSliderTrainer(DiffusionTrainer):
                 guidance_embedding_scale=1.0,
                 batch=batch,
             )
-
-            if self.sd.prediction_type == "v_prediction":
-                target = self.sd.noise_scheduler.get_velocity(
-                    noisy_combined, noise_combined, ts_combined
-                )
-            else:
-                target = noise_combined
 
             img_loss = torch.nn.functional.mse_loss(
                 noise_pred.float(), target.float()

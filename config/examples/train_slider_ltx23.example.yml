@@ -1,0 +1,167 @@
+---
+# LTX-Video 2.3 Concept Slider Training Example
+#
+# Concept sliders teach the model a bipolar concept axis (e.g. day ↔ night)
+# using contrastive prompt pairs — no training videos required.
+# The images in the dataset are ignored; they only provide a latent shape/noise
+# carrier for the training loop. A 512x512 blank placeholder image is included
+# at config/examples/slider_dummy_dataset/ for convenience.
+#
+# Hardware target: RTX 3090 24GB with quantization + layer offloading.
+# The text encoder (Gemma) is frozen and offloaded after prompt caching.
+#
+# Usage:
+#   python run.py config/examples/train_slider_ltx23.example.yml
+#
+# The resulting LoRA can be applied at inference time with a multiplier:
+#   positive multiplier (e.g. +3.0) → enhances the positive concept (daytime)
+#   negative multiplier (e.g. -3.0) → enhances the negative concept (nighttime)
+
+job: extension
+config:
+  name: "day_night_slider_ltx23_v1"
+  process:
+    - type: "concept_slider"
+
+      # root folder to save training sessions/samples/weights
+      training_folder: "output"
+      device: cuda:0
+
+      network:
+        type: "lora"
+        # rank 16 is a good starting point for concept sliders on 24GB.
+        # Higher rank (32-64) gives more capacity but uses more VRAM.
+        linear: 16
+        linear_alpha: 16  # note: overridden to equal rank for transformer models (peft_format)
+
+        # --- Layer targeting ---
+        # By default ALL linear layers inside transformer_blocks are trained:
+        # video self-attn (attn1), video cross-attn (attn2), video FF (ff),
+        # audio self-attn (audio_attn1), audio cross-attn (audio_attn2), audio FF (audio_ff),
+        # and cross-modal (audio_to_video_attn, video_to_audio_attn).
+        #
+        # For a visual concept slider you almost certainly want to exclude audio layers.
+        # Use network_kwargs to filter by substring of the full module path:
+        #
+        # Video-only (recommended for visual concept sliders):
+        network_kwargs:
+          ignore_if_contains: ["audio_"]
+        #
+        # Other useful combinations (uncomment one block at a time):
+        #
+        # Attention-only, no feed-forward (video + audio):
+        # network_kwargs:
+        #   ignore_if_contains: ["ff.net"]
+        #
+        # Only cross-modal audio↔video layers:
+        # network_kwargs:
+        #   only_if_contains: ["audio_to_video_attn", "video_to_audio_attn"]
+        #
+        # Everything (no filter) — default if network_kwargs is omitted:
+        # network_kwargs: {}
+
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 4
+
+      # The dataset images are NOT used for slider concept learning —
+      # only their encoded latents serve as noise carriers for the training loop.
+      # Any image folder works here; a blank placeholder is provided for convenience.
+      datasets:
+        - folder_path: "config/examples/slider_dummy_dataset"
+          caption_ext: "txt"
+          num_frames: 1      # keep at 1 (image mode) — avoids i2v/audio complexity
+          do_i2v: false      # explicitly disable image-to-video conditioning
+          resolution: 512
+
+      train:
+        batch_size: 1
+        steps: 500           # 300–1000 is typical; start low and evaluate
+        gradient_accumulation: 1
+        train_unet: true     # trains the video transformer (named 'unet' for compat)
+        train_text_encoder: false  # Gemma must stay frozen
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        timestep_type: "linear"
+        optimizer: "adamw8bit"
+        lr: 1e-4
+        optimizer_params:
+          weight_decay: 1e-4
+        dtype: bf16
+
+        # Offload Gemma after prompt embeddings are cached at startup.
+        # Required for 24GB — Gemma alone is ~12GB.
+        unload_text_encoder: true
+
+      model:
+        # Set this to your local LTX-Video-2.3 checkpoint path.
+        # This should be a directory containing the model safetensors
+        # (e.g. downloaded from Lightricks/LTX-Video-2.3 on HuggingFace).
+        name_or_path: "/path/to/LTX-Video-2.3"
+        arch: "ltx2"
+        quantize: true       # quantize transformer to int8 for 24GB
+        quantize_te: true    # quantize text encoder during its brief use at startup
+        low_vram: true       # enable layer offloading to system RAM
+
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 512
+        height: 512
+        # num_frames must satisfy: (num_frames - 1) % 8 == 0
+        # Valid values: 1, 9, 17, 25, 33, 41, 49 ...
+        # Use 1 for fast image samples during training, 25 for short video clips.
+        num_frames: 25
+        fps: 24
+        # Use --m <value> to control the slider multiplier at sample time.
+        # Positive values push toward the positive concept, negative toward negative.
+        prompts:
+          - "a mountain landscape at midday --m -4"
+          - "a mountain landscape at midday --m -2"
+          - "a mountain landscape at midday --m 2"
+          - "a mountain landscape at midday --m 4"
+          - "a city street --m -4"
+          - "a city street --m -2"
+          - "a city street --m 2"
+          - "a city street --m 4"
+        neg: ""
+        seed: 42
+        walk_seed: false
+        guidance_scale: 4.0
+        sample_steps: 30
+        network_multiplier: 1.0
+
+      logging:
+        log_every: 10
+        use_wandb: false
+        verbose: false
+
+      slider:
+        # guidance_strength controls how strongly the contrastive offset is applied
+        # to the training targets. 3.0 is a sensible default; increase for a stronger
+        # effect, decrease if the slider becomes too aggressive.
+        guidance_strength: 3.0
+
+        # anchor_strength weights the anchor loss term (if anchor_class is set).
+        # The anchor prevents unrelated concepts from drifting.
+        anchor_strength: 1.0
+
+        # target_class: the neutral/base context for the slider.
+        # Leave blank for a fully generic slider, or set to a subject (e.g. "a landscape")
+        # to bias the slider toward that domain.
+        target_class: ""
+
+        # The two poles of the concept axis.
+        # positive_prompt → what the slider's positive direction should feel like.
+        # negative_prompt → what the slider's negative direction should feel like.
+        positive_prompt: "daytime scene, bright sunlight, blue sky, golden hour lighting, day"
+        negative_prompt: "nighttime scene, dark sky, stars, moonlight, night, low light"
+
+        # Optional: anchor_class keeps unrelated concepts stable.
+        # Uncomment and set to a neutral prompt to prevent concept bleed.
+        # anchor_class: "a photo"
+
+meta:
+  name: "[name]"
+  version: "1.0"

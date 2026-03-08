@@ -1310,6 +1310,23 @@ class LTX2Model(BaseModel):
         text_embeddings: PromptEmbeds,
         batch: "DataLoaderBatchDTO" = None,
     ):
+        # Safety guard: slider-style training (no dataset) may pass batch=None.
+        # Provide a minimal stub so downstream attribute accesses don't crash.
+        if batch is None:
+            class _BatchStub:
+                class dataset_config:
+                    do_i2v = False
+                    num_frames = 1
+                    do_audio = False
+                audio_latents = None
+                audio_tensor = None
+                audio_data = None
+                audio_target = None
+                audio_pred = None
+                first_frame_latents = None
+                tensor = None
+            batch = _BatchStub()
+
         _tc = getattr(self, "train_config", None)
         use_independent_audio_ts = getattr(_tc, "independent_audio_timestep", True) if _tc is not None else True
         model_device = self._module_device(self.transformer)

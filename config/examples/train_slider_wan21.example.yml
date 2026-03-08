@@ -1,0 +1,128 @@
+---
+job: extension
+config:
+  name: "my_slider_wan21_v1"
+  process:
+    - type: "concept_slider"
+      training_folder: "output"
+      device: cuda:0
+
+      network:
+        type: "lora"
+        linear: 16
+        linear_alpha: 16
+
+      model:
+        name_or_path: "Wan-AI/Wan2.1-T2V-14B-Diffusers"
+        arch: "wan21"
+        quantize: true
+        quantize_te: true
+        low_vram: true
+
+      train:
+        steps: 500
+        lr: 1e-4
+        noise_scheduler: "flowmatch"
+        timestep_type: "sigmoid"
+        optimizer: "adamw8bit"
+        gradient_checkpointing: true
+        train_unet: true
+        train_text_encoder: false
+        unload_text_encoder: true
+        dtype: bf16
+        batch_size: 1
+        noise_offset: 0.0
+
+      save:
+        dtype: float16
+        save_every: 100
+        max_step_saves_to_keep: 2
+
+      sample:
+        sampler: "flowmatch"
+        sample_every: 100
+        width: 832
+        height: 480
+        num_frames: 25
+        # --m sets LoRA multiplier: negative = erased concept, positive = enhanced concept
+        prompts:
+          - "a person walking in a park --m -3"
+          - "a person walking in a park --m -1"
+          - "a person walking in a park --m 1"
+          - "a person walking in a park --m 3"
+          - "a city street at noon --m -3"
+          - "a city street at noon --m 3"
+        seed: 42
+        guidance_scale: 5.0
+        sample_steps: 20
+        network_multiplier: 1.0
+
+      logging:
+        log_every: 10
+        verbose: false
+
+      slider:
+        guidance_strength: 3.0
+        anchor_strength: 1.0
+
+        # ------------------------------------------------------------------
+        # Multi-target form (new — Phase 1)
+        # Each target defines one positive/negative concept axis.
+        # All targets are trained jointly; use weight to balance their influence.
+        # ------------------------------------------------------------------
+        targets:
+          - target_class: ""
+            positive: "high detail, 8k, intricate, sharp, high resolution, high quality"
+            negative: "blurry, low detail, low quality, soft focus, low resolution"
+            weight: 1.0
+
+          # Optional second target (e.g. domain-specific):
+          # - target_class: "person"
+          #   positive: "highly detailed person, sharp features, fine texture"
+          #   negative: "blurry person, soft focus, indistinct"
+          #   weight: 0.5
+
+        # ------------------------------------------------------------------
+        # Multi-anchor form (new — Phase 1)
+        # Anchors constrain the LoRA so it doesn't drift on unrelated concepts.
+        # Optional — comment out if not needed.
+        # ------------------------------------------------------------------
+        # anchors:
+        #   - prompt: "video quality"
+        #     multiplier: 1.0
+        #   - prompt: "a person"
+        #     multiplier: 0.5
+
+        # ------------------------------------------------------------------
+        # Backward-compatible single-pair form (still works, no change needed)
+        # Uncomment below and remove the targets: block to use legacy syntax:
+        # ------------------------------------------------------------------
+        # positive_prompt: "high detail, 8k, intricate, sharp"
+        # negative_prompt: "blurry, low detail, low quality"
+        # target_class: ""
+        # anchor_class: "video quality"
+
+        # ------------------------------------------------------------------
+        # Image pair datasets (Phase 2, optional)
+        # Combinable with text targets above.
+        # Comment in to enable image-pair supervised training.
+        # ------------------------------------------------------------------
+        # datasets:
+        #   # Side-by-side pairs: left half = negative image, right half = positive image
+        #   - pair_folder: "/path/to/side-by-side-pairs"
+        #     network_weight: 2.0
+        #     target_class: ""      # fallback caption if no .txt file alongside image
+        #     size: 512
+        #
+        #   # Separate pos/neg folders (filenames must match across folders)
+        #   - pos_folder: "/path/to/positive-images"
+        #     neg_folder: "/path/to/negative-images"
+        #     network_weight: 2.0
+        #     target_class: ""
+        #     size: 512
+
+        # img_loss_weight: 1.0   # scale for image pair MSE loss
+        # cfg_loss_weight: 1.0   # scale for CFG slider loss
+
+meta:
+  name: "[name]"
